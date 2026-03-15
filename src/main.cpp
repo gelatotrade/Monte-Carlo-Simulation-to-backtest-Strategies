@@ -301,6 +301,87 @@ int main() {
         }
     }
 
+    // --- 7. Export time-evolving PnL surfaces (animated) -------------------
+    std::cout << "[6/6] Generating time-evolving PnL surfaces (live animation data)...\n";
+    {
+        // Build a live spot + IV path from the MC median path
+        // Simulate intraday resolution: interpolate between daily steps
+        int intraday_steps_per_day = 60;  // ~1 point per 6.5 min (390 min / 60)
+        int trade_horizon_days = 30;
+        int total_intra_steps = trade_horizon_days * intraday_steps_per_day;
+
+        // Use the median spot/iv from MC paths for the first 30 days
+        std::vector<double> live_spot(total_intra_steps);
+        std::vector<double> live_iv(total_intra_steps);
+        std::vector<VolRegime> live_regime(total_intra_steps);
+
+        // Extract daily medians for first 30 days
+        std::vector<double> daily_spot(trade_horizon_days + 1);
+        std::vector<double> daily_iv(trade_horizon_days + 1);
+        for (int d = 0; d <= trade_horizon_days && d <= paths.n_steps; ++d) {
+            std::vector<double> spots(paths.n_paths), vols(paths.n_paths);
+            for (int p = 0; p < paths.n_paths; ++p) {
+                spots[p] = paths.paths[p][d];
+                vols[p]  = paths.vol_paths[p][d];
+            }
+            std::sort(spots.begin(), spots.end());
+            std::sort(vols.begin(), vols.end());
+            daily_spot[d] = spots[paths.n_paths / 2];
+            daily_iv[d]   = vols[paths.n_paths / 2];
+        }
+
+        // Interpolate to intraday with micro-noise for realism
+        std::mt19937 rng(123);
+        std::normal_distribution<> noise(0.0, 1.0);
+        std::vector<double> iv_hist;
+        for (int t = 0; t < total_intra_steps; ++t) {
+            double day_frac = static_cast<double>(t) / intraday_steps_per_day;
+            int d0 = static_cast<int>(day_frac);
+            int d1 = std::min(d0 + 1, trade_horizon_days);
+            double alpha = day_frac - d0;
+
+            double base_spot = daily_spot[d0] * (1.0 - alpha) + daily_spot[d1] * alpha;
+            double base_iv   = daily_iv[d0] * (1.0 - alpha) + daily_iv[d1] * alpha;
+
+            // Add intraday micro-movement
+            double spot_noise = base_spot * 0.0003 * noise(rng);  // ~3bp noise
+            double iv_noise   = base_iv * 0.002 * noise(rng);     // ~20bp vol noise
+
+            live_spot[t] = base_spot + spot_noise;
+            live_iv[t]   = std::max(base_iv + iv_noise, 0.05);
+
+            double prev_iv = (t > 0) ? live_iv[t - 1] * 100.0 : live_iv[t] * 100.0;
+            iv_hist.push_back(live_iv[t] * 100.0);
+            auto rs = regime_clf.classify(live_iv[t] * 100.0, prev_iv, 0.0, iv_hist);
+            live_regime[t] = rs.regime;
+        }
+
+        int n_frames = 120;  // 120 frames for smooth animation
+
+        for (size_t i = 0; i < strategies.size(); ++i) {
+            std::string sname = strategies[i].name;
+            std::replace(sname.begin(), sname.end(), ' ', '_');
+            std::string fname = "output/" + std::to_string(i) + "_" + sname + "_evolving.csv";
+
+            double S0 = live_spot[0], r = 0.04, iv = live_iv[0], q = 0.015;
+            auto legs = strategies[i].generate(S0, iv, r, q, VolRegime::Medium);
+            if (legs.empty()) {
+                for (auto reg : {VolRegime::High, VolRegime::Low, VolRegime::Expansion, VolRegime::Crush}) {
+                    legs = strategies[i].generate(S0, iv, r, q, reg);
+                    if (!legs.empty()) break;
+                }
+            }
+            if (!legs.empty()) {
+                VolSurface3D::export_evolving_surfaces(
+                    fname, legs, r, q,
+                    strategies[i].dte_entry / DAYS_PER_YEAR,
+                    live_spot, live_iv, live_regime,
+                    n_frames, 35, 25);
+                std::cout << "   Exported: " << fname << " (" << n_frames << " frames)\n";
+            }
+        }
+    }
+
     // --- Comparative summary ---------------------------------------------
     std::cout << "\n============================================================\n";
     std::cout << "  COMPARATIVE SUMMARY\n";

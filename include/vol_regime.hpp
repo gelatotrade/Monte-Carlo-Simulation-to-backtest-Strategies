@@ -128,6 +128,81 @@ public:
             }
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Export time-evolving PnL surfaces — simulates how the surface changes
+    // minute-by-minute as spot and IV move along a live path.
+    //
+    // Each frame = one time snapshot with:
+    //   - A full Spot × IV → PnL grid (the surface at that instant)
+    //   - Current live spot & IV (the "cursor" on the surface)
+    //   - Remaining DTE (theta decay reshapes the surface)
+    //   - Active vol regime
+    // -----------------------------------------------------------------------
+    static void export_evolving_surfaces(
+            const std::string& filename,
+            const std::vector<Leg>& legs,
+            double r, double q,
+            double initial_T,                          // DTE at entry (years)
+            const std::vector<double>& spot_path,      // live spot over time
+            const std::vector<double>& iv_path,        // live IV over time (decimal)
+            const std::vector<VolRegime>& regime_path, // regime at each step
+            int n_frames,                              // how many frames to export
+            int spot_grid_steps = 40,
+            int iv_grid_steps   = 30) {
+
+        if (spot_path.empty() || iv_path.empty()) return;
+
+        int total_steps = static_cast<int>(spot_path.size());
+        int frame_skip  = std::max(1, total_steps / n_frames);
+
+        std::ofstream out(filename);
+        out << "Frame,Minute,DTE_days,LiveSpot,LiveIV,Regime,"
+            << "Spot,IV,PnL,Delta,Gamma,Vega,Theta\n";
+
+        for (int frame = 0; frame < n_frames && frame * frame_skip < total_steps; ++frame) {
+            int t = frame * frame_skip;
+            double live_spot = spot_path[t];
+            double live_iv   = iv_path[t];
+            VolRegime regime = (t < static_cast<int>(regime_path.size()))
+                               ? regime_path[t] : VolRegime::Medium;
+
+            // Time remaining shrinks each frame
+            double frac_elapsed = static_cast<double>(t) / total_steps;
+            double T_remaining  = initial_T * (1.0 - frac_elapsed);
+            double dte_days     = T_remaining * DAYS_PER_YEAR;
+
+            // Grid centered on live spot, range ±10%
+            double spot_min = live_spot * 0.90;
+            double spot_max = live_spot * 1.10;
+            // IV range centered on live IV, ±50% relative
+            double iv_min = std::max(live_iv * 0.50, 0.05);
+            double iv_max = live_iv * 1.50;
+
+            int minute = static_cast<int>(frac_elapsed * initial_T * DAYS_PER_YEAR * 390); // 390 min/day
+
+            for (int si = 0; si <= spot_grid_steps; ++si) {
+                double S = spot_min + (spot_max - spot_min) * si / spot_grid_steps;
+                for (int vi = 0; vi <= iv_grid_steps; ++vi) {
+                    double iv = iv_min + (iv_max - iv_min) * vi / iv_grid_steps;
+                    auto res = StrategyFactory::evaluate(legs, S, r, iv,
+                                                         std::max(T_remaining, 0.0), q);
+                    out << frame << "," << minute << ","
+                        << std::fixed << std::setprecision(2) << dte_days << ","
+                        << std::setprecision(2) << live_spot << ","
+                        << std::setprecision(4) << live_iv << ","
+                        << VolRegimeClassifier::regime_name(regime) << ","
+                        << std::setprecision(2) << S << ","
+                        << std::setprecision(4) << iv << ","
+                        << std::setprecision(4) << res.net_pnl << ","
+                        << std::setprecision(4) << res.delta << ","
+                        << std::setprecision(6) << res.gamma << ","
+                        << std::setprecision(4) << res.vega << ","
+                        << std::setprecision(4) << res.theta << "\n";
+                }
+            }
+        }
+    }
 };
 
 } // namespace opts

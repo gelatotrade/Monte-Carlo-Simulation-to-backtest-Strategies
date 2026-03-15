@@ -41,6 +41,39 @@ Each point represents a daily snapshot, colour-coded by the active volatility re
 |:-:|:-:|
 | ![Calendar PnL Surface](docs/images/4_Calendar_Spread_pnl_surface.png) | ![Strangle PnL Surface](docs/images/5_Short_Strangle_pnl_surface.png) |
 
+### Live Time-Evolving PnL Surfaces (Animated)
+
+The surfaces below update **minute-by-minute** as spot price and implied volatility move along the simulated path. Watch how theta decay reshapes the surface, how the live cursor (red dot) tracks the current market position, and how the volatility regime shifts in real time:
+
+#### All Strategies — Mid-Trade Snapshot
+![Composite Snapshot](docs/images/evolving_surfaces_composite.png)
+
+#### Short Iron Condor — Live Surface Animation
+![Iron Condor Animated](docs/images/1_Short_Iron_Condor_animated.gif)
+
+#### Long Butterfly — Live Surface Animation
+![Butterfly Animated](docs/images/2_Long_Butterfly_animated.gif)
+
+#### Vega Expansion Straddle — Live Surface Animation
+![Straddle Animated](docs/images/0_Vega_Expansion_Straddle_animated.gif)
+
+#### Short Iron Butterfly — Live Surface Animation
+![Iron Butterfly Animated](docs/images/3_Short_Iron_Butterfly_animated.gif)
+
+#### Calendar Spread — Live Surface Animation
+![Calendar Animated](docs/images/4_Calendar_Spread_animated.gif)
+
+#### Short Strangle — Live Surface Animation
+![Strangle Animated](docs/images/5_Short_Strangle_animated.gif)
+
+**What each animation shows:**
+- **Surface** (Spot × IV → PnL): The 3D payoff landscape at the current time, colour-coded green (profit) to red (loss)
+- **Red cursor**: Current live position (spot price × implied volatility) on the surface
+- **Crosshairs**: Spot and IV slices through the current position
+- **Title bar**: Real-time DTE, time (HH:MM), regime, spot, IV, and all Greeks (Delta, Gamma, Vega, Theta)
+- **Regime indicator**: Coloured bar showing the active volatility regime (Low/Medium/High/Crush/Expansion)
+- **Camera rotation**: Gentle azimuth wobble for full surface perspective
+
 ### Volatility Regime Analysis
 
 | Regime Distribution & P&L Attribution | Implied Volatility Time-Series with Regime Shading |
@@ -55,7 +88,7 @@ Each point represents a daily snapshot, colour-coded by the active volatility re
 - [Architecture](#architecture)
 - [Strategies Implemented](#strategies-implemented)
 - [Volatility Regime Classification](#volatility-regime-classification)
-- [3D Coordinate System](#3d-coordinate-system)
+- [3D Coordinate System & Live Evolving Surfaces](#3d-coordinate-system--live-evolving-surfaces)
 - [Monte Carlo Simulation](#monte-carlo-simulation)
 - [Black-Scholes Pricing Engine](#black-scholes-pricing-engine)
 - [Backtesting Engine](#backtesting-engine)
@@ -80,6 +113,7 @@ This engine combines **Monte Carlo path simulation** with a **volatility regime 
 - **6 options strategies**: Straddles, Strangles, Butterflies, Iron Condors, Iron Butterflies, Calendar Spreads
 - **Volatility regime detection**: Low, Medium, High, Expansion, Crush
 - **3D coordinate system** mapping IV × PnL × S&P 500 with regime colour-coding
+- **Animated time-evolving PnL surfaces** — watch surfaces morph minute-by-minute as spot, IV, and DTE change
 - **S&P 500 buy-and-hold benchmark** comparison
 - **Comprehensive statistics**: Sharpe, Sortino, max drawdown, win rate, profit factor, alpha
 - **Per-regime P&L attribution** — see which vol environment each strategy profits in
@@ -293,7 +327,7 @@ regime_clf.crush_rate        = -1.0;   // Monthly vol pts drop → "Crush"
 
 ---
 
-## 3D Coordinate System
+## 3D Coordinate System & Live Evolving Surfaces
 
 The engine generates data for a **3-dimensional coordinate system** where:
 
@@ -310,13 +344,43 @@ Each point is colour-coded by the active **volatility regime** at that time step
 - **Regime clustering** — where in the IV/Spot space each regime occurs
 - **Risk pockets** — dangerous combinations of IV and spot for a given strategy
 
-### PnL Surface (Grid)
+### PnL Surface (Static Grid)
 
-Additionally, the engine generates a **Spot × IV → PnL** surface grid for each strategy at entry, enabling:
+The engine generates a **Spot × IV → PnL** surface grid for each strategy at entry, enabling:
 
 - Visualization of the **full payoff landscape** across spot prices and implied volatility levels
 - Identification of **breakeven boundaries** in IV-Spot space
 - Understanding of **vega sensitivity** (how PnL shifts as IV changes)
+
+### Time-Evolving Surfaces (Animated)
+
+The key innovation: the engine exports **minute-by-minute surface snapshots** that show how each strategy's PnL surface **morphs in real time** as:
+
+1. **Spot price moves** along the Monte Carlo simulated path (with intraday micro-noise)
+2. **Implied volatility shifts** — the surface re-centres and reshapes
+3. **Theta decay** progressively collapses the surface as DTE approaches zero
+4. **Regime transitions** change the colour indicator and surface characteristics
+
+![Evolving Surfaces Composite](docs/images/evolving_surfaces_composite.png)
+
+Each animated frame contains:
+- A **full Spot × IV → PnL** surface grid re-computed at the current DTE
+- **Live Greeks** (Delta, Gamma, Vega, Theta) at the current spot/IV position
+- A **red cursor** tracking the live market position on the surface
+- **Crosshair slices** through the surface at the current spot and IV
+- **Regime indicator** showing the active volatility environment
+- **DTE countdown** and **intraday timestamp** (HH:MM)
+
+The surface grid dynamically re-centres around the current spot (±10%) and IV (±50%) to maintain relevant resolution as the market moves.
+
+```
+Frame generation pipeline:
+  1. Interpolate MC daily path → intraday resolution (60 steps/day)
+  2. Add micro-noise (3bp spot, 20bp vol) for realistic tick-by-tick movement
+  3. At each frame: recompute full Spot × IV grid at current remaining DTE
+  4. Export: Spot, IV, PnL, Delta, Gamma, Vega, Theta per grid point
+  5. Animate: 120 frames → compressed GIF (40 frames, 200ms/frame)
+```
 
 ---
 
@@ -473,9 +537,12 @@ cd ..
 # Run the backtesting engine
 ./build/backtest
 
-# Generate 3D visualizations
-pip install matplotlib numpy pandas
+# Generate static 3D visualizations
+pip install matplotlib numpy pandas Pillow
 python3 scripts/visualize.py
+
+# Generate animated time-evolving surface GIFs
+python3 scripts/animate_surfaces.py
 ```
 
 ### Debug Build
@@ -496,9 +563,11 @@ Monte-Carlo-Simulation-to-backtest-Strategies/
 ├── README.md                   # This file
 │
 ├── docs/
-│   └── images/                 # Visualization PNGs (committed to repo)
+│   └── images/                 # Visualization PNGs + GIFs (committed to repo)
 │       ├── *_3d_regime.png     # 3D regime scatter plots
 │       ├── *_pnl_surface.png   # PnL surface plots
+│       ├── *_animated.gif      # Animated time-evolving PnL surfaces
+│       ├── evolving_surfaces_composite.png
 │       ├── equity_curves_comparison.png
 │       ├── regime_distribution.png
 │       └── iv_timeseries_regimes.png
@@ -515,16 +584,19 @@ Monte-Carlo-Simulation-to-backtest-Strategies/
 │   └── main.cpp                # Entry point: config → simulate → backtest → export
 │
 ├── scripts/
-│   └── visualize.py            # Python 3D visualization suite (5 plot types)
+│   ├── visualize.py            # Python 3D visualization suite (5 plot types)
+│   └── animate_surfaces.py     # Animated time-evolving surface GIF generator
 │
 ├── output/                     # Generated at runtime
 │   ├── *_equity.csv            # Equity curves per strategy
 │   ├── *_trades.csv            # Trade logs per strategy
 │   ├── *_3d_surface.csv        # 3D scatter data (IV × PnL × SP500)
 │   ├── *_pnl_grid.csv          # PnL surface grids (Spot × IV)
-│   └── plots/                  # Generated PNG visualizations
+│   ├── *_evolving.csv          # Time-evolving surface data (120 frames)
+│   └── plots/                  # Generated PNG/GIF visualizations
 │       ├── *_3d_regime.png     # 3D regime scatter plots
 │       ├── *_pnl_surface.png   # PnL surface plots
+│       ├── *_animated.gif      # Animated evolving surface GIFs
 │       ├── equity_curves_comparison.png
 │       ├── regime_distribution.png
 │       └── iv_timeseries_regimes.png
@@ -544,6 +616,7 @@ Monte-Carlo-Simulation-to-backtest-Strategies/
 | `*_trades.csv` | Full trade log with entry/exit prices, IV, regime | Trade analysis |
 | `*_3d_surface.csv` | IV, PnL, SP500, Regime per time step | 3D scatter visualisation |
 | `*_pnl_grid.csv` | Spot × IV → PnL grid | 3D surface plot |
+| `*_evolving.csv` | Frame, Minute, DTE, LiveSpot, LiveIV, Regime, grid points with Greeks | Animated surface GIFs |
 
 ### Visualizations
 
@@ -551,6 +624,8 @@ Monte-Carlo-Simulation-to-backtest-Strategies/
 |------|-------------|
 | **3D Regime Scatter** | IV × PnL × SP500 colour-coded by vol regime |
 | **PnL Surface** | 3D surface: how PnL changes across spot & IV space |
+| **Animated Surface GIFs** | Time-evolving surfaces with live cursor, Greeks, regime, DTE countdown |
+| **Composite Snapshot** | All 6 strategies' live surfaces at mid-trade point |
 | **Equity Curves** | All strategies vs S&P 500 benchmark with drawdown |
 | **Regime Distribution** | Pie chart (trade count) + bar chart (PnL by regime) |
 | **IV Time-Series** | Implied vol over time with regime-shaded background |
