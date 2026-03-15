@@ -4,6 +4,51 @@ A high-performance **C++ backtesting engine** for complex options strategies wit
 
 ---
 
+## Visual Overview
+
+### Strategy Equity Curves vs S&P 500 Benchmark
+All six strategies compared against a passive S&P 500 buy-and-hold, with drawdown overlay:
+
+![Equity Curves Comparison](docs/images/equity_curves_comparison.png)
+
+### 3D Volatility Regime Map (IV × PnL × S&P 500)
+Each point represents a daily snapshot, colour-coded by the active volatility regime:
+
+| Long Butterfly | Short Iron Condor |
+|:-:|:-:|
+| ![Long Butterfly 3D](docs/images/2_Long_Butterfly_3d_regime.png) | ![Short Iron Condor 3D](docs/images/1_Short_Iron_Condor_3d_regime.png) |
+
+| Vega Expansion Straddle | Short Iron Butterfly |
+|:-:|:-:|
+| ![Vega Expansion Straddle 3D](docs/images/0_Vega_Expansion_Straddle_3d_regime.png) | ![Short Iron Butterfly 3D](docs/images/3_Short_Iron_Butterfly_3d_regime.png) |
+
+| Calendar Spread | Short Strangle |
+|:-:|:-:|
+| ![Calendar Spread 3D](docs/images/4_Calendar_Spread_3d_regime.png) | ![Short Strangle 3D](docs/images/5_Short_Strangle_3d_regime.png) |
+
+### PnL Surface Plots (Spot × IV → PnL)
+3D surfaces showing how each strategy's P&L changes across the full range of spot prices and implied volatility levels:
+
+| Short Iron Condor | Long Butterfly |
+|:-:|:-:|
+| ![Iron Condor PnL Surface](docs/images/1_Short_Iron_Condor_pnl_surface.png) | ![Butterfly PnL Surface](docs/images/2_Long_Butterfly_pnl_surface.png) |
+
+| Vega Expansion Straddle | Short Iron Butterfly |
+|:-:|:-:|
+| ![Straddle PnL Surface](docs/images/0_Vega_Expansion_Straddle_pnl_surface.png) | ![Iron Butterfly PnL Surface](docs/images/3_Short_Iron_Butterfly_pnl_surface.png) |
+
+| Calendar Spread | Short Strangle |
+|:-:|:-:|
+| ![Calendar PnL Surface](docs/images/4_Calendar_Spread_pnl_surface.png) | ![Strangle PnL Surface](docs/images/5_Short_Strangle_pnl_surface.png) |
+
+### Volatility Regime Analysis
+
+| Regime Distribution & P&L Attribution | Implied Volatility Time-Series with Regime Shading |
+|:-:|:-:|
+| ![Regime Distribution](docs/images/regime_distribution.png) | ![IV Time-Series](docs/images/iv_timeseries_regimes.png) |
+
+---
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -93,6 +138,10 @@ Payoff:  Long Call (ATM) + Long Put (ATM)
 - **DTE**: 30 days
 - **Edge**: Long vega exposure benefits from IV increase
 
+| 3D Regime Map | PnL Surface |
+|:-:|:-:|
+| ![Straddle 3D](docs/images/0_Vega_Expansion_Straddle_3d_regime.png) | ![Straddle Surface](docs/images/0_Vega_Expansion_Straddle_pnl_surface.png) |
+
 ### 2. Short Iron Condor
 
 **Thesis**: Collect premium by selling OTM puts and calls with protective wings in medium-to-high vol environments.
@@ -110,6 +159,10 @@ PL = Put Long, PS = Put Short, CS = Call Short, CL = Call Long
 - **DTE**: 30 days
 - **Wing width**: 5% of spot per side
 - **Edge**: Theta decay + mean-reversion of elevated IV
+
+| 3D Regime Map | PnL Surface |
+|:-:|:-:|
+| ![Iron Condor 3D](docs/images/1_Short_Iron_Condor_3d_regime.png) | ![Iron Condor Surface](docs/images/1_Short_Iron_Condor_pnl_surface.png) |
 
 ### 3. Long Butterfly Spread
 
@@ -129,6 +182,10 @@ Payoff:
 - **Width**: 3% of spot
 - **Edge**: Profits when spot stays range-bound and IV declines
 
+| 3D Regime Map | PnL Surface |
+|:-:|:-:|
+| ![Butterfly 3D](docs/images/2_Long_Butterfly_3d_regime.png) | ![Butterfly Surface](docs/images/2_Long_Butterfly_pnl_surface.png) |
+
 ### 4. Short Iron Butterfly
 
 **Thesis**: Maximum premium collection at ATM. Combines short straddle with protective wings for defined risk.
@@ -146,6 +203,10 @@ Payoff:
 - **DTE**: 30 days
 - **Edge**: Highest premium collection of all defined-risk strategies
 
+| 3D Regime Map | PnL Surface |
+|:-:|:-:|
+| ![Iron Butterfly 3D](docs/images/3_Short_Iron_Butterfly_3d_regime.png) | ![Iron Butterfly Surface](docs/images/3_Short_Iron_Butterfly_pnl_surface.png) |
+
 ### 5. Calendar Spread (Horizontal)
 
 **Thesis**: Exploit term-structure discrepancies. Short near-dated, long far-dated options at the same strike.
@@ -160,6 +221,10 @@ Time decay profile:
 - **Entry condition**: Vol regime = Medium or Low
 - **DTE**: Short 21-day, Long 60-day
 - **Edge**: Profits from near-term theta decay while long-term option retains value
+
+| 3D Regime Map | PnL Surface |
+|:-:|:-:|
+| ![Calendar 3D](docs/images/4_Calendar_Spread_3d_regime.png) | ![Calendar Surface](docs/images/4_Calendar_Spread_pnl_surface.png) |
 
 ### 6. Short Strangle
 
@@ -176,6 +241,10 @@ Payoff:
 - **DTE**: 30 days
 - **Width**: 5% OTM each side
 - **Edge**: Maximum theta in high-IV, profits from vol mean-reversion
+
+| 3D Regime Map | PnL Surface |
+|:-:|:-:|
+| ![Strangle 3D](docs/images/5_Short_Strangle_3d_regime.png) | ![Strangle Surface](docs/images/5_Short_Strangle_pnl_surface.png) |
 
 ---
 
@@ -201,6 +270,16 @@ The engine classifies each trading day into one of five regimes based on implied
 5. Compute IV − RV spread (implied vs realised)
 6. Apply threshold-based classification
 ```
+
+### Implied Volatility with Regime Shading
+
+The IV time-series below shows how the regime classifier labels each trading day, with background shading by regime:
+
+![IV Time-Series with Regimes](docs/images/iv_timeseries_regimes.png)
+
+### Trade Distribution & P&L by Regime
+
+![Regime Distribution](docs/images/regime_distribution.png)
 
 ### Configurable Parameters
 
@@ -349,6 +428,10 @@ Newton-Raphson solver with:
 
 ## Performance Metrics
 
+### Strategy Equity Curves with Drawdown
+
+![Equity Curves](docs/images/equity_curves_comparison.png)
+
 The engine computes the following for each strategy:
 
 | Metric | Description |
@@ -411,6 +494,14 @@ make -j$(nproc)
 Monte-Carlo-Simulation-to-backtest-Strategies/
 ├── CMakeLists.txt              # Build configuration
 ├── README.md                   # This file
+│
+├── docs/
+│   └── images/                 # Visualization PNGs (committed to repo)
+│       ├── *_3d_regime.png     # 3D regime scatter plots
+│       ├── *_pnl_surface.png   # PnL surface plots
+│       ├── equity_curves_comparison.png
+│       ├── regime_distribution.png
+│       └── iv_timeseries_regimes.png
 │
 ├── include/                    # Header-only library
 │   ├── common.hpp              # Types, constants, date helpers, normal CDF
