@@ -89,6 +89,7 @@ The surfaces below update **minute-by-minute** as spot price and implied volatil
 - [Strategies Implemented](#strategies-implemented)
 - [Volatility Regime Classification](#volatility-regime-classification)
 - [3D Coordinate System & Live Evolving Surfaces](#3d-coordinate-system--live-evolving-surfaces)
+- [ARIMA Forecasting Model](#arima-forecasting-model)
 - [Monte Carlo Simulation](#monte-carlo-simulation)
 - [Black-Scholes Pricing Engine](#black-scholes-pricing-engine)
 - [Backtesting Engine](#backtesting-engine)
@@ -114,6 +115,7 @@ This engine combines **Monte Carlo path simulation** with a **volatility regime 
 - **Volatility regime detection**: Low, Medium, High, Expansion, Crush
 - **3D coordinate system** mapping IV × PnL × S&P 500 with regime colour-coding
 - **Animated time-evolving PnL surfaces** — watch surfaces morph minute-by-minute as spot, IV, and DTE change
+- **ARIMA(p,d,q) forecasting** — auto-fitted IV/spot models with predictive regime switching, early exit, and IV direction filters
 - **S&P 500 buy-and-hold benchmark** comparison
 - **Comprehensive statistics**: Sharpe, Sortino, max drawdown, win rate, profit factor, alpha
 - **Per-regime P&L attribution** — see which vol environment each strategy profits in
@@ -133,22 +135,29 @@ This engine combines **Monte Carlo path simulation** with a **volatility regime 
     │ Monte Carlo │  │  Strategies │  │   Backtester   │
     │  Simulator  │  │   Factory   │  │    Engine      │
     │ (Heston)    │  │ (6 strats)  │  │ (trade logic)  │
-    └────────┬────┘  └──────┬──────┘  └───┬────────────┘
-             │              │              │
-    ┌────────▼──────────────▼──────────────▼──────────┐
-    │              Black-Scholes Pricer                 │
-    │         (pricing, Greeks, implied vol)            │
-    └─────────────────────┬────────────────────────────┘
+    └────────┬────┘  └──────┬──────┘  └───┬──────┬─────┘
+             │              │              │      │
+    ┌────────▼──────────────▼──────────────▼──┐   │
+    │              Black-Scholes Pricer        │   │
+    │         (pricing, Greeks, implied vol)   │   │
+    └─────────────────────┬───────────────────┘   │
+                          │                       │
+    ┌─────────────────────▼──────────────────┐    │
+    │       Volatility Regime Classifier     │    │
+    │  (Low / Medium / High / Crush / Exp)   │    │
+    └─────────────────────┬──────────────────┘    │
+                          │                       │
+    ┌─────────────────────▼──────────────────┐    │
+    │      ARIMA(p,d,q) Forecast Engine      │◄───┘
+    │  Auto-fit · IV/Spot prediction · CI    │
+    │  Predictive regime · Early exit signal  │
+    └─────────────────────┬──────────────────┘
                           │
-    ┌─────────────────────▼────────────────────────────┐
-    │           Volatility Regime Classifier            │
-    │      (Low / Medium / High / Crush / Expansion)   │
-    └─────────────────────┬────────────────────────────┘
-                          │
-    ┌─────────────────────▼────────────────────────────┐
-    │         3D Surface (IV × PnL × SP500)            │
-    │              CSV Export → Python viz              │
-    └──────────────────────────────────────────────────┘
+    ┌─────────────────────▼──────────────────┐
+    │     3D Surface (IV × PnL × SP500)      │
+    │  Static · Animated · ARIMA overlays    │
+    │         CSV Export → Python viz         │
+    └────────────────────────────────────────┘
 ```
 
 ---
@@ -384,6 +393,84 @@ Frame generation pipeline:
 
 ---
 
+## ARIMA Forecasting Model
+
+The engine includes a **full ARIMA(p,d,q) implementation from scratch in C++** — no external libraries required. It forecasts implied volatility and spot prices to enhance trading signals.
+
+### What is ARIMA?
+
+**A**uto**R**egressive **I**ntegrated **M**oving **A**verage — a time-series forecasting model with three components:
+
+| Component | Formula | Purpose |
+|-----------|---------|---------|
+| **AR(p)** | y_t = c + Σ φ_i · y_{t-i} | Past values predict future values |
+| **I(d)** | Δ^d y_t | Differencing to achieve stationarity |
+| **MA(q)** | y_t += Σ θ_j · ε_{t-j} | Past forecast errors improve predictions |
+
+### Auto-ARIMA Model Selection
+
+The engine automatically selects the optimal (p, d, q) order via grid search:
+
+```
+1. Determine d: variance reduction test across d = 0, 1, 2
+2. Grid search: p ∈ [0, p_max], q ∈ [0, q_max]
+3. For each (p, d, q):
+   a. Fit via Conditional Least Squares (iterative OLS)
+   b. Compute AIC = −2·log(L) + 2·k
+   c. Check AR stationarity (Σ|φ_i| < 1)
+4. Select model with lowest AIC
+```
+
+### How ARIMA Enhances Trading Signals
+
+The ARIMA model improves the backtester in three ways:
+
+| Enhancement | Mechanism | Benefit |
+|-------------|-----------|---------|
+| **Predictive Regime** | Forecast IV → predict next regime before it arrives | Enter positions **ahead** of regime transitions |
+| **IV Direction Filter** | Skip entries where ARIMA contradicts the strategy | Avoid selling vol before predicted spike |
+| **Early Exit** | Close positions when ARIMA forecasts adverse regime | Cut losses before vol crush/expansion hits |
+
+### ARIMA Diagnostics
+
+| IV Forecast with 95% CI | Standard vs ARIMA Equity |
+|:-:|:-:|
+| ![IV Forecast](docs/images/2_Long_Butterfly_arima_forecast.png) | ![Equity Comparison](docs/images/2_Long_Butterfly_arima_equity_comparison.png) |
+
+| ARIMA Signal Analysis | Model Diagnostics (Residual ACF) |
+|:-:|:-:|
+| ![Trade Analysis](docs/images/2_Long_Butterfly_arima_trade_analysis.png) | ![Diagnostics](docs/images/2_Long_Butterfly_arima_diagnostics.png) |
+
+### Comparative Results: Standard vs ARIMA-Enhanced
+
+![ARIMA Comparison](docs/images/arima_comparison.png)
+
+### ARIMA Configuration
+
+```cpp
+ARIMASignalGenerator arima_gen;
+arima_gen.lookback           = 60;     // rolling window for fitting
+arima_gen.forecast_horizon   = 5;      // days ahead to forecast
+arima_gen.refit_freq         = 5;      // re-estimate every 5 days
+arima_gen.p_max              = 3;      // AR order search bound
+arima_gen.d_max              = 1;      // differencing search bound
+arima_gen.q_max              = 3;      // MA order search bound
+arima_gen.direction_threshold = 0.005; // min % change for direction signal
+```
+
+### Implementation Details
+
+The ARIMA engine (`include/arima.hpp`) includes:
+
+- **OLS regression** via Gaussian elimination with partial pivoting
+- **Conditional Least Squares** estimation (iterative AR + MA)
+- **Confidence intervals** with horizon-dependent standard errors
+- **Ljung-Box test** for residual autocorrelation diagnostics
+- **Rolling forecasts** at configurable intervals during the backtest
+- **CSV export** of forecasts, residuals, and fitted values
+
+---
+
 ## Monte Carlo Simulation
 
 The engine uses a **stochastic volatility model** (Heston-lite) with a CIR variance process:
@@ -568,6 +655,11 @@ Monte-Carlo-Simulation-to-backtest-Strategies/
 │       ├── *_pnl_surface.png   # PnL surface plots
 │       ├── *_animated.gif      # Animated time-evolving PnL surfaces
 │       ├── evolving_surfaces_composite.png
+│       ├── *_arima_forecast.png      # ARIMA IV forecast fan charts
+│       ├── *_arima_equity_comparison.png  # Standard vs ARIMA equity
+│       ├── *_arima_trade_analysis.png # ARIMA signal analysis
+│       ├── *_arima_diagnostics.png   # Residual ACF, fitted vs actual
+│       ├── arima_comparison.png      # All strategies: Standard vs ARIMA
 │       ├── equity_curves_comparison.png
 │       ├── regime_distribution.png
 │       └── iv_timeseries_regimes.png
@@ -578,6 +670,7 @@ Monte-Carlo-Simulation-to-backtest-Strategies/
 │   ├── monte_carlo.hpp         # Stochastic vol MC simulator
 │   ├── strategies.hpp          # Strategy factory (6 strategies) & evaluator
 │   ├── vol_regime.hpp          # Vol regime classifier & 3D surface
+│   ├── arima.hpp               # ARIMA(p,d,q) model, auto-fit, forecast, diagnostics
 │   └── backtester.hpp          # Backtesting engine with full statistics
 │
 ├── src/
@@ -585,7 +678,8 @@ Monte-Carlo-Simulation-to-backtest-Strategies/
 │
 ├── scripts/
 │   ├── visualize.py            # Python 3D visualization suite (5 plot types)
-│   └── animate_surfaces.py     # Animated time-evolving surface GIF generator
+│   ├── animate_surfaces.py     # Animated time-evolving surface GIF generator
+│   └── arima_plots.py          # ARIMA forecast diagnostics & comparison plots
 │
 ├── output/                     # Generated at runtime
 │   ├── *_equity.csv            # Equity curves per strategy
@@ -593,6 +687,10 @@ Monte-Carlo-Simulation-to-backtest-Strategies/
 │   ├── *_3d_surface.csv        # 3D scatter data (IV × PnL × SP500)
 │   ├── *_pnl_grid.csv          # PnL surface grids (Spot × IV)
 │   ├── *_evolving.csv          # Time-evolving surface data (120 frames)
+│   ├── *_arima_forecasts.csv   # Rolling ARIMA IV/spot forecasts
+│   ├── *_arima_equity.csv      # ARIMA-enhanced equity curves
+│   ├── *_arima_trades.csv      # Trade log with ARIMA metadata
+│   ├── *_arima_iv_diag.csv     # ARIMA model residuals & diagnostics
 │   └── plots/                  # Generated PNG/GIF visualizations
 │       ├── *_3d_regime.png     # 3D regime scatter plots
 │       ├── *_pnl_surface.png   # PnL surface plots

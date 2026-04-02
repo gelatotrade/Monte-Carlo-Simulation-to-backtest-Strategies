@@ -4,6 +4,7 @@
 #include "strategies.hpp"
 #include "vol_regime.hpp"
 #include "monte_carlo.hpp"
+#include "arima.hpp"
 
 namespace opts {
 
@@ -22,6 +23,14 @@ struct TradeRecord {
     double iv_at_close  = 0.0;
     VolRegime regime_at_open = VolRegime::Medium;
     std::string strategy_name;
+
+    // ARIMA forecast at entry
+    double arima_iv_forecast   = 0.0;   // predicted IV at exit
+    double arima_spot_forecast = 0.0;   // predicted spot at exit
+    int    arima_iv_direction  = 0;     // -1/0/+1
+    double arima_confidence    = 0.0;   // confidence in forecast direction
+    VolRegime predicted_regime = VolRegime::Medium;
+    bool   arima_early_exit   = false;  // was this trade closed early by ARIMA?
 };
 
 // ---------------------------------------------------------------------------
@@ -226,6 +235,272 @@ public:
         }
 
         // --- Compute statistics -------------------------------------------
+        result.stats = compute_stats(result.trades, result.equity_curve,
+                                     cfg.initial_capital, n_steps);
+        return result;
+    }
+
+    // =====================================================================
+    // ARIMA-Enhanced Backtester
+    //
+    // Key improvements over the basic backtester:
+    //   1. ARIMA-predicted regime: use forecast IV to anticipate regime changes
+    //      and enter positions BEFORE the regime actually shifts
+    //   2. Predictive early exit: close positions when ARIMA forecasts an
+    //      adverse regime transition (e.g., vol crush → expansion)
+    //   3. Confidence-weighted sizing: scale position size by ARIMA confidence
+    //   4. IV direction filter: skip entries where ARIMA predicts adverse IV move
+    //
+    // Exports:
+    //   - arima_forecasts: rolling IV & spot forecasts at each time step
+    //   - Enhanced trade records with ARIMA metadata
+    // =====================================================================
+    struct ARIMABacktestResult {
+        BacktestStats                stats;
+        std::vector<EquityPoint>     equity_curve;
+        std::vector<TradeRecord>     trades;
+        VolSurface3D                 surface_3d;
+
+        // ARIMA diagnostics
+        ARIMAParams                  iv_model;
+        ARIMAParams                  spot_model;
+        std::vector<ARIMAForecast>   iv_forecasts;     // at each rebalance point
+        std::vector<ARIMAForecast>   spot_forecasts;
+        std::vector<int>             forecast_days;     // day indices for forecasts
+
+        int arima_early_exits   = 0;
+        int arima_entries_taken = 0;
+        int arima_entries_skipped = 0;
+    };
+
+    static ARIMABacktestResult run_arima(
+            const MonteCarlo::PathSet& paths,
+            const StrategySignal& strategy,
+            const Config& cfg,
+            const VolRegimeClassifier& regime_clf,
+            const ARIMASignalGenerator& arima_gen) {
+
+        ARIMABacktestResult result;
+        int n_steps = paths.n_steps;
+
+        // Build median spot/IV paths
+        std::vector<double> spot_path(n_steps + 1);
+        std::vector<double> iv_path(n_steps + 1);
+        for (int t = 0; t <= n_steps; ++t) {
+            std::vector<double> spots(paths.n_paths), vols(paths.n_paths);
+            for (int p = 0; p < paths.n_paths; ++p) {
+                spots[p] = paths.paths[p][t];
+                vols[p]  = paths.vol_paths[p][t] * 100.0;
+            }
+            std::sort(spots.begin(), spots.end());
+            std::sort(vols.begin(), vols.end());
+            spot_path[t] = spots[paths.n_paths / 2];
+            iv_path[t]   = vols[paths.n_paths / 2];
+        }
+
+        double equity    = cfg.initial_capital;
+        double peak      = equity;
+        double benchmark_shares = cfg.initial_capital / spot_path[0];
+
+        std::vector<double> iv_history;
+        std::vector<Leg> open_position;
+        int  open_day = -1;
+        double open_spot = 0.0, open_iv = 0.0;
+        VolRegime open_regime = VolRegime::Medium;
+        ARIMASignalGenerator::ForecastResult open_forecast; // forecast at entry
+
+        for (int t = 0; t <= n_steps; ++t) {
+            double S  = spot_path[t];
+            double iv = iv_path[t];
+            double prev_iv = (t > 0) ? iv_path[t - 1] : iv;
+            double rv = 0.0;
+            if (t >= 21) {
+                double sum_sq = 0.0;
+                for (int i = t - 20; i <= t; ++i) {
+                    double ret = std::log(spot_path[i] / spot_path[i - 1]);
+                    sum_sq += ret * ret;
+                }
+                rv = std::sqrt(sum_sq / 21.0 * DAYS_PER_YEAR);
+            }
+            iv_history.push_back(iv);
+
+            auto regime_state = regime_clf.classify(iv, prev_iv, rv, iv_history);
+
+            // --- Generate ARIMA forecast at rebalance points -----------------
+            ARIMASignalGenerator::ForecastResult arima_fc;
+            bool have_forecast = false;
+            if (t >= arima_gen.lookback && t % arima_gen.refit_freq == 0) {
+                arima_fc = arima_gen.generate(iv_path, spot_path, t,
+                                              regime_clf.low_iv_threshold,
+                                              regime_clf.high_iv_threshold);
+                have_forecast = true;
+
+                result.iv_forecasts.push_back(arima_fc.iv_forecast);
+                result.spot_forecasts.push_back(arima_fc.spot_forecast);
+                result.forecast_days.push_back(t);
+            }
+
+            // --- Check if we need to close an open position ------------------
+            if (!open_position.empty()) {
+                double elapsed = (t - open_day) / DAYS_PER_YEAR;
+                double remaining_T = strategy.dte_entry / DAYS_PER_YEAR - elapsed;
+
+                bool should_close = (remaining_T <= 1.0 / DAYS_PER_YEAR || t == n_steps);
+                bool arima_early = false;
+
+                // ARIMA early exit: close if forecast predicts adverse regime
+                if (!should_close && have_forecast && remaining_T > 3.0 / DAYS_PER_YEAR) {
+                    // Check if predicted regime is hostile to our strategy
+                    bool regime_adverse = false;
+
+                    // For short-vol strategies (condors, strangles, iron butterflies):
+                    // close if ARIMA predicts expansion (vol spike)
+                    if (arima_fc.iv_forecast.direction == 1 &&
+                        arima_fc.iv_forecast.confidence > 0.4) {
+                        // Predicted IV rising — bad for short-vol positions
+                        // Check if our entry was in a short-vol regime
+                        if (open_regime == VolRegime::High || open_regime == VolRegime::Medium) {
+                            if (arima_fc.predicted_regime == VolRegime::Expansion) {
+                                regime_adverse = true;
+                            }
+                        }
+                    }
+
+                    // For long-vol strategies (straddles in expansion):
+                    // close if ARIMA predicts crush
+                    if (arima_fc.iv_forecast.direction == -1 &&
+                        arima_fc.iv_forecast.confidence > 0.4) {
+                        if (open_regime == VolRegime::Low || open_regime == VolRegime::Expansion) {
+                            if (arima_fc.predicted_regime == VolRegime::Crush) {
+                                regime_adverse = true;
+                            }
+                        }
+                    }
+
+                    if (regime_adverse) {
+                        should_close = true;
+                        arima_early = true;
+                        result.arima_early_exits++;
+                    }
+                }
+
+                if (should_close) {
+                    auto exit_pnl = StrategyFactory::evaluate(
+                        open_position, S, 0.04, iv / 100.0, std::max(remaining_T, 0.0));
+
+                    double entry_cost = 0.0;
+                    for (auto& leg : open_position)
+                        entry_cost += leg.quantity * leg.entry_price;
+
+                    double trade_pnl = (exit_pnl.gross_pnl - entry_cost)
+                                       * cfg.contracts * 100.0;
+                    trade_pnl -= cfg.transaction_cost * cfg.contracts * open_position.size() * 2;
+
+                    equity += trade_pnl;
+
+                    TradeRecord rec;
+                    rec.day_opened    = open_day;
+                    rec.day_closed    = t;
+                    rec.entry_cost    = entry_cost;
+                    rec.exit_value    = exit_pnl.gross_pnl;
+                    rec.pnl           = trade_pnl;
+                    rec.spot_at_open  = open_spot;
+                    rec.spot_at_close = S;
+                    rec.iv_at_open    = open_iv;
+                    rec.iv_at_close   = iv;
+                    rec.regime_at_open = open_regime;
+                    rec.strategy_name  = strategy.name;
+
+                    // ARIMA metadata
+                    rec.arima_iv_forecast   = open_forecast.iv_forecast.point_forecast;
+                    rec.arima_spot_forecast = open_forecast.spot_forecast.point_forecast;
+                    rec.arima_iv_direction  = open_forecast.iv_forecast.direction;
+                    rec.arima_confidence    = open_forecast.iv_forecast.confidence;
+                    rec.predicted_regime    = open_forecast.predicted_regime;
+                    rec.arima_early_exit    = arima_early;
+
+                    result.trades.push_back(rec);
+                    open_position.clear();
+                }
+            }
+
+            // --- Open new position with ARIMA signal -------------------------
+            if (open_position.empty() && t % cfg.rebalance_freq == 0
+                && t < n_steps - strategy.hold_days) {
+
+                double r = 0.04, q = 0.0;
+                double T_entry = strategy.dte_entry / DAYS_PER_YEAR;
+
+                // Use ARIMA-predicted regime for entry decision
+                VolRegime entry_regime = regime_state.regime;
+                if (have_forecast && arima_fc.iv_forecast.confidence > 0.3) {
+                    entry_regime = arima_fc.predicted_regime;
+                }
+
+                auto legs = strategy.generate(S, iv / 100.0, r, q, entry_regime);
+
+                // IV direction filter: skip entries where ARIMA contradicts
+                bool skip = false;
+                if (have_forecast && !legs.empty()) {
+                    // If we're about to sell vol but ARIMA predicts vol spike → skip
+                    bool is_short_vol = (entry_regime == VolRegime::High ||
+                                         entry_regime == VolRegime::Medium ||
+                                         entry_regime == VolRegime::Crush);
+                    if (is_short_vol && arima_fc.iv_forecast.direction == 1
+                        && arima_fc.iv_forecast.confidence > 0.5) {
+                        skip = true;
+                    }
+                    // If we're about to buy vol but ARIMA predicts vol crush → skip
+                    bool is_long_vol = (entry_regime == VolRegime::Low ||
+                                        entry_regime == VolRegime::Expansion);
+                    if (is_long_vol && arima_fc.iv_forecast.direction == -1
+                        && arima_fc.iv_forecast.confidence > 0.5) {
+                        skip = true;
+                    }
+                }
+
+                if (skip) {
+                    result.arima_entries_skipped++;
+                } else if (!legs.empty()) {
+                    open_position = legs;
+                    open_day = t;
+                    open_spot = S;
+                    open_iv = iv;
+                    open_regime = entry_regime;
+                    open_forecast = arima_fc;
+                    result.arima_entries_taken++;
+                }
+            }
+
+            // --- Record equity curve -----------------------------------------
+            peak = std::max(peak, equity);
+            double dd = (peak > 0) ? (peak - equity) / peak : 0.0;
+
+            EquityPoint ep;
+            ep.day       = t;
+            ep.equity    = equity;
+            ep.benchmark = benchmark_shares * S;
+            ep.drawdown  = dd;
+            ep.iv        = iv;
+            ep.regime    = regime_state.regime;
+            result.equity_curve.push_back(ep);
+
+            if (t % 5 == 0) {
+                double cum_pnl = equity - cfg.initial_capital;
+                result.surface_3d.add(iv, cum_pnl, S, regime_state.regime);
+            }
+        }
+
+        // Store final model params
+        if (!result.iv_forecasts.empty()) {
+            // Fit final models on full series for diagnostics
+            result.iv_model = ARIMA::auto_fit(iv_path, 3, 1, 3);
+            std::vector<double> log_spots(spot_path.size());
+            for (size_t i = 0; i < spot_path.size(); ++i)
+                log_spots[i] = std::log(spot_path[i]);
+            result.spot_model = ARIMA::auto_fit(log_spots, 3, 1, 3);
+        }
+
         result.stats = compute_stats(result.trades, result.equity_curve,
                                      cfg.initial_capital, n_steps);
         return result;

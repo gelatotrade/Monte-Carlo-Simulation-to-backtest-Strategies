@@ -199,12 +199,82 @@ StrategySignal make_short_strangle() {
     return sig;
 }
 
+// ---------------------------------------------------------------------------
+// Helper: print ARIMA-enhanced backtest report
+// ---------------------------------------------------------------------------
+static void print_arima_report(const std::string& name,
+                               const Backtester::ARIMABacktestResult& res) {
+    auto& s = res.stats;
+    std::cout << "\n========================================================\n";
+    std::cout << "  ARIMA-ENHANCED REPORT: " << name << "\n";
+    std::cout << "========================================================\n";
+    std::cout << std::fixed << std::setprecision(2);
+    std::cout << "  Total Return:       " << s.total_return * 100.0 << " %\n";
+    std::cout << "  Annualised Return:  " << s.annualised_return * 100.0 << " %\n";
+    std::cout << "  Alpha:              " << s.alpha * 100.0 << " %\n";
+    std::cout << "  Sharpe Ratio:       " << s.sharpe_ratio << "\n";
+    std::cout << "  Sortino Ratio:      " << s.sortino_ratio << "\n";
+    std::cout << "  Max Drawdown:       " << s.max_drawdown * 100.0 << " %\n";
+    std::cout << "  Win Rate:           " << s.win_rate << " %\n";
+    std::cout << "  Total Trades:       " << s.total_trades << "\n";
+    std::cout << "\n  --- ARIMA Signal Stats ---\n";
+    std::cout << "    Entries taken:    " << res.arima_entries_taken << "\n";
+    std::cout << "    Entries skipped:  " << res.arima_entries_skipped
+              << " (IV direction filter)\n";
+    std::cout << "    Early exits:      " << res.arima_early_exits
+              << " (adverse regime forecast)\n";
+
+    if (res.iv_model.n_obs > 0) {
+        std::cout << "\n  --- IV ARIMA Model ---\n";
+        std::cout << "    Order:   ARIMA(" << res.iv_model.p << ","
+                  << res.iv_model.d << "," << res.iv_model.q << ")\n";
+        std::cout << "    AIC:     " << std::setprecision(1) << res.iv_model.aic << "\n";
+        std::cout << "    BIC:     " << res.iv_model.bic << "\n";
+        std::cout << "    RMSE:    " << std::setprecision(4) << res.iv_model.rmse << "\n";
+        std::cout << "    AR:      [";
+        for (size_t i = 0; i < res.iv_model.ar_coeffs.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << std::setprecision(4) << res.iv_model.ar_coeffs[i];
+        }
+        std::cout << "]\n";
+        std::cout << "    MA:      [";
+        for (size_t i = 0; i < res.iv_model.ma_coeffs.size(); ++i) {
+            if (i > 0) std::cout << ", ";
+            std::cout << std::setprecision(4) << res.iv_model.ma_coeffs[i];
+        }
+        std::cout << "]\n";
+    }
+    std::cout << "========================================================\n\n";
+}
+
+// ---------------------------------------------------------------------------
+// Helper: export ARIMA forecast CSV
+// ---------------------------------------------------------------------------
+static void export_arima_csv(const std::string& filename,
+                             const Backtester::ARIMABacktestResult& res) {
+    std::ofstream out(filename);
+    out << "Day,IV_Forecast,IV_Lower95,IV_Upper95,IV_Direction,IV_Confidence,"
+        << "Spot_Forecast,Spot_Lower95,Spot_Upper95,Spot_Direction\n";
+    for (size_t i = 0; i < res.iv_forecasts.size(); ++i) {
+        auto& ivf = res.iv_forecasts[i];
+        auto& spf = (i < res.spot_forecasts.size()) ? res.spot_forecasts[i] : ivf;
+        int day = (i < res.forecast_days.size()) ? res.forecast_days[i] : 0;
+        out << day << ","
+            << std::fixed << std::setprecision(4)
+            << ivf.point_forecast << "," << ivf.lower_95 << "," << ivf.upper_95 << ","
+            << ivf.direction << "," << ivf.confidence << ","
+            << std::setprecision(2)
+            << spf.point_forecast << "," << spf.lower_95 << "," << spf.upper_95 << ","
+            << spf.direction << "\n";
+    }
+}
+
 // =========================================================================
 // MAIN
 // =========================================================================
 int main() {
     std::cout << "============================================================\n";
-    std::cout << "   Options Strategy Backtesting Engine (Monte Carlo)        \n";
+    std::cout << "   Options Strategy Backtesting Engine (Monte Carlo + ARIMA)\n";
     std::cout << "   S&P 500 Benchmark  |  Volatility Regime Analysis        \n";
     std::cout << "============================================================\n\n";
 
@@ -382,9 +452,79 @@ int main() {
         }
     }
 
-    // --- Comparative summary ---------------------------------------------
+    // --- 8. ARIMA-Enhanced Backtests -------------------------------------
+    std::cout << "\n[7/7] Running ARIMA-enhanced backtests...\n";
+
+    ARIMASignalGenerator arima_gen;
+    arima_gen.lookback         = 60;
+    arima_gen.forecast_horizon = 5;
+    arima_gen.refit_freq       = 5;
+    arima_gen.p_max            = 3;
+    arima_gen.d_max            = 1;
+    arima_gen.q_max            = 3;
+    arima_gen.direction_threshold = 0.005;
+
+    std::vector<Backtester::ARIMABacktestResult> arima_results;
+    for (auto& strat : strategies) {
+        auto res = Backtester::run_arima(paths, strat, bt_cfg, regime_clf, arima_gen);
+        print_arima_report(strat.name, res);
+        arima_results.push_back(std::move(res));
+    }
+
+    // Export ARIMA data
+    std::cout << "   Exporting ARIMA forecast data...\n";
+    for (size_t i = 0; i < strategies.size(); ++i) {
+        std::string sname = strategies[i].name;
+        std::replace(sname.begin(), sname.end(), ' ', '_');
+        std::string prefix = "output/" + std::to_string(i) + "_" + sname;
+
+        // ARIMA forecasts CSV
+        export_arima_csv(prefix + "_arima_forecasts.csv", arima_results[i]);
+
+        // ARIMA equity curve
+        export_equity_csv(prefix + "_arima_equity.csv", arima_results[i].equity_curve);
+
+        // ARIMA trade log
+        {
+            std::ofstream out(prefix + "_arima_trades.csv");
+            out << "Strategy,DayOpened,DayClosed,SpotOpen,SpotClose,IVOpen,IVClose,"
+                << "EntryCost,ExitValue,PnL,Regime,ARIMA_IV_Forecast,ARIMA_Direction,"
+                << "ARIMA_Confidence,PredictedRegime,EarlyExit\n";
+            for (auto& t : arima_results[i].trades) {
+                out << t.strategy_name << "," << t.day_opened << "," << t.day_closed << ","
+                    << std::fixed << std::setprecision(2)
+                    << t.spot_at_open << "," << t.spot_at_close << ","
+                    << t.iv_at_open << "," << t.iv_at_close << ","
+                    << std::setprecision(4)
+                    << t.entry_cost << "," << t.exit_value << ","
+                    << std::setprecision(2) << t.pnl << ","
+                    << VolRegimeClassifier::regime_name(t.regime_at_open) << ","
+                    << std::setprecision(4) << t.arima_iv_forecast << ","
+                    << t.arima_iv_direction << ","
+                    << std::setprecision(4) << t.arima_confidence << ","
+                    << VolRegimeClassifier::regime_name(t.predicted_regime) << ","
+                    << (t.arima_early_exit ? "YES" : "NO") << "\n";
+            }
+        }
+
+        // ARIMA model diagnostics
+        if (arima_results[i].iv_model.n_obs > 0) {
+            export_arima_diagnostics(prefix + "_arima_iv_diag.csv",
+                                    arima_results[i].equity_curve.empty()
+                                    ? std::vector<double>{}
+                                    : [&]() {
+                                        std::vector<double> ivs;
+                                        for (auto& ep : arima_results[i].equity_curve)
+                                            ivs.push_back(ep.iv);
+                                        return ivs;
+                                    }(),
+                                    arima_results[i].iv_model, "IV");
+        }
+    }
+
+    // --- Comparative summary (Standard vs ARIMA) -------------------------
     std::cout << "\n============================================================\n";
-    std::cout << "  COMPARATIVE SUMMARY\n";
+    std::cout << "  COMPARATIVE SUMMARY (Standard vs ARIMA-Enhanced)\n";
     std::cout << "============================================================\n";
     std::cout << std::left << std::setw(26) << "Strategy"
               << std::right << std::setw(10) << "Return"
@@ -408,10 +548,35 @@ int main() {
     std::cout << std::string(76, '-') << "\n";
     std::cout << "  Benchmark (S&P 500):  "
               << results[0].stats.benchmark_return * 100.0 << "% total return\n";
+    std::cout << "\n  ARIMA-Enhanced:\n";
+    std::cout << std::string(76, '-') << "\n";
+    std::cout << std::left << std::setw(26) << "Strategy (ARIMA)"
+              << std::right << std::setw(10) << "Return"
+              << std::setw(10) << "Sharpe"
+              << std::setw(10) << "MaxDD"
+              << std::setw(10) << "WinRate"
+              << std::setw(10) << "Alpha"
+              << "\n";
+    std::cout << std::string(76, '-') << "\n";
+    for (size_t i = 0; i < strategies.size(); ++i) {
+        auto& s = arima_results[i].stats;
+        std::cout << std::left << std::setw(26) << (strategies[i].name + " *")
+                  << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(9) << s.annualised_return * 100.0 << "%"
+                  << std::setw(10) << s.sharpe_ratio
+                  << std::setw(9) << s.max_drawdown * 100.0 << "%"
+                  << std::setw(9) << s.win_rate << "%"
+                  << std::setw(9) << s.alpha * 100.0 << "%"
+                  << "\n";
+    }
+    std::cout << std::string(76, '-') << "\n";
+    std::cout << "  * = ARIMA-enhanced (predictive regime + IV direction filter + early exit)\n";
     std::cout << "============================================================\n";
 
     std::cout << "\nAll results exported to output/ directory.\n";
-    std::cout << "Run 'python3 scripts/visualize.py' to generate 3D plots.\n\n";
+    std::cout << "Run 'python3 scripts/visualize.py' to generate 3D plots.\n";
+    std::cout << "Run 'python3 scripts/animate_surfaces.py' for animated surfaces.\n";
+    std::cout << "Run 'python3 scripts/arima_plots.py' for ARIMA diagnostics.\n\n";
 
     return 0;
 }
